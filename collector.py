@@ -1,4 +1,4 @@
-import time, urllib.error, copy
+import time, urllib.error, copy, subprocess
 from unittest.mock import patch
 import datetime as dt, json, math, sqlite3, tempfile, unittest, urllib.request
 from zoneinfo import ZoneInfo
@@ -17,6 +17,14 @@ def get(url):
             if attempt==2: raise
         print("RETRY",url,attempt+1,flush=True)
         time.sleep(2**attempt)
+def weather_fetch(url):
+    try:
+        return get(url)
+    except (urllib.error.URLError,TimeoutError,ConnectionError) as e:
+        if isinstance(e,urllib.error.HTTPError) or (isinstance(e,urllib.error.URLError) and not isinstance(e.reason,(TimeoutError,ConnectionError))): raise
+        print('WEATHER_TRANSPORT_FALLBACK',repr(e),flush=True)
+        result=subprocess.run(['curl','--fail','--silent','--show-error','--ipv4','--connect-timeout','8','--max-time','18',url],capture_output=True,check=True,timeout=20)
+        return json.loads(result.stdout)
 def evidence(value,unit,date,url):
     return dict(value=value,unit=unit,date=str(date),source=url)
 def fx(rows,b,q,day,url):
@@ -94,6 +102,14 @@ class Tests(unittest.TestCase):
         with patch('urllib.request.urlopen',side_effect=urllib.error.HTTPError('https://example.com',400,'bad',None,None)) as f:
             with self.assertRaises(urllib.error.HTTPError): get('https://example.com')
             self.assertEqual(f.call_count,1)
+    def test_transport_fallback(self):
+        with patch('__main__.get',side_effect=urllib.error.URLError(TimeoutError())), patch('subprocess.run',return_value=subprocess.CompletedProcess([],0,b'{"ok":true}',b'')) as f:
+            self.assertEqual(weather_fetch('https://example.com'),{'ok':True})
+            self.assertIn('--ipv4',f.call_args.args[0])
+            self.assertNotIn('--insecure',f.call_args.args[0])
+        with patch('__main__.get',side_effect=ValueError('bad data')), patch('subprocess.run') as f:
+            with self.assertRaises(ValueError): weather_fetch('https://example.com')
+            f.assert_not_called()
     def test_recovery(self):
         with tempfile.TemporaryDirectory() as t:
             p=t+'/db'; a=Ledger(p)
@@ -105,7 +121,7 @@ class Tests(unittest.TestCase):
 def live():
     day=dt.datetime.now(ZoneInfo('Asia/Jerusalem')).date()
     url='https://api.open-meteo.com/v1/forecast?latitude=31.78&longitude=35.22&hourly=temperature_2m,apparent_temperature,precipitation_probability,wind_speed_10m&daily=temperature_2m_max,temperature_2m_min&timezone=Asia%2FJerusalem&forecast_days=2'
-    tasks=[('weather',lambda:weather(get(url),day,url))]
+    tasks=[('weather',lambda:weather(weather_fetch(url),day,url))]
     for b in ('USD','EUR'):
         for q in ('ILS','GEL'):
             def collect(b=b,q=q):
