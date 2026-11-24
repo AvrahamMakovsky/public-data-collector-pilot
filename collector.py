@@ -1,10 +1,22 @@
+import time, urllib.error, copy
+from unittest.mock import patch
 import datetime as dt, json, math, sqlite3, tempfile, unittest, urllib.request
 from zoneinfo import ZoneInfo
 def require(ok,msg):
     if not ok: raise ValueError(msg)
 def num(x): return type(x) in (float,int) and math.isfinite(x)
 def get(url):
-    with urllib.request.urlopen(url,timeout=20) as r: return json.load(r)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(url,timeout=12) as r: return json.load(r)
+        except urllib.error.HTTPError as e:
+            if e.code not in (408,429,500,502,503,504) or attempt==2: raise
+        except urllib.error.URLError as e:
+            if not isinstance(e.reason,(TimeoutError,ConnectionError)) or attempt==2: raise
+        except (TimeoutError,ConnectionError):
+            if attempt==2: raise
+        print("RETRY",url,attempt+1,flush=True)
+        time.sleep(2**attempt)
 def evidence(value,unit,date,url):
     return dict(value=value,unit=unit,date=str(date),source=url)
 def fx(rows,b,q,day,url):
@@ -38,6 +50,8 @@ def weather(d,day,url):
             require(k!='wind_speed_10m' or v>=0,'wind')
             out[f'{hour:02}/{k}']=evidence(v,u,stamp,url)
     a=d['daily']
+    require(len(set(a['time']))==len(a['time']),'duplicate days')
+    require(all(len(a[k])==len(a['time']) for k in ('temperature_2m_min','temperature_2m_max')),'daily length')
     for offset in (0,1):
         date=str(day+dt.timedelta(days=offset)); i=a['time'].index(date)
         lo,hi=[a[k][i] for k in ('temperature_2m_min','temperature_2m_max')]
@@ -63,6 +77,23 @@ class Tests(unittest.TestCase):
         self.assertEqual(fx(rows,'USD','ILS',day,'fixture')['1Y']['value'],50)
         for bad in [rows[:-1],rows+[rows[0]], [dict(r,quote='EUR') for r in rows], [dict(r,rate=True) for r in rows]]:
             with self.assertRaises(ValueError): fx(bad,'USD','ILS',day,'fixture')
+    def test_weather(self):
+        day=dt.date(2026,1,1)
+        keys={'temperature_2m':'°C','apparent_temperature':'°C','precipitation_probability':'%','wind_speed_10m':'km/h'}
+        times=[f'{day}T{h:02}:00' for h in (8,9,17,18)]
+        d=dict(timezone='Asia/Jerusalem',hourly_units=keys,hourly=dict(time=times,**{k:[10]*4 for k in keys}),daily_units={'temperature_2m_min':'°C','temperature_2m_max':'°C'},daily=dict(time=[str(day),str(day+dt.timedelta(days=1))],temperature_2m_min=[5,6],temperature_2m_max=[15,16]))
+        self.assertEqual(len(weather(d,day,'fixture')),20)
+        for group,key,value in [('hourly_units','temperature_2m','°F'),('hourly','precipitation_probability',[101]*4),('hourly','wind_speed_10m',[-1]*4),('hourly','temperature_2m',[True]*4),('hourly','time',times[:3]+[times[0]]),('daily','temperature_2m_min',[20,6]),('daily','time',[str(day)]*2),('daily','temperature_2m_max',[15]),('daily_units','temperature_2m_min','°F')]:
+            with self.subTest(group=group,key=key):
+                bad=copy.deepcopy(d); bad[group][key]=value
+                with self.assertRaises(ValueError): weather(bad,day,'fixture')
+    def test_retry(self):
+        with patch('urllib.request.urlopen',side_effect=[urllib.error.URLError(TimeoutError()),TimeoutError(),TimeoutError()]) as f, patch('time.sleep'):
+            with self.assertRaises(TimeoutError): get('https://example.com')
+            self.assertEqual(f.call_count,3)
+        with patch('urllib.request.urlopen',side_effect=urllib.error.HTTPError('https://example.com',400,'bad',None,None)) as f:
+            with self.assertRaises(urllib.error.HTTPError): get('https://example.com')
+            self.assertEqual(f.call_count,1)
     def test_recovery(self):
         with tempfile.TemporaryDirectory() as t:
             p=t+'/db'; a=Ledger(p)
