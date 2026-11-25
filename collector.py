@@ -138,7 +138,9 @@ def live():
 if __name__=='__main__':
     # Market tests use synthetic data only; the live lanes below remain weather/FX.
     from market_history import MarketTests
+    from exchange_calendar import CalendarTests
     suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(Tests),
-                              unittest.defaultTestLoader.loadTestsFromTestCase(MarketTests)])
+                              unittest.defaultTestLoader.loadTestsFromTestCase(MarketTests),
+                              unittest.defaultTestLoader.loadTestsFromTestCase(CalendarTests)])
     require(unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful(),'regressions')
     live()

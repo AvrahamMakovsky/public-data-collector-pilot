@@ -11,6 +11,7 @@ import os
 import unittest
 from urllib.parse import urlencode, urlsplit
 from urllib.request import urlopen
+from exchange_calendar import check_coverage, scheduled_sessions
 
 FRED = {"SP500": "S&P 500", "NASDAQ100": "Nasdaq 100"}
 GATED = ("FTSE All-World", "TA-35", "TA-125", "1183441", "1209220", "1186063")
@@ -50,7 +51,7 @@ def parse_fred(text, series, as_of):
     return rows
 
 
-def market_history(rows, series, as_of, source, input_kind):
+def market_history(rows, series, as_of, source, input_kind, require_schedule=False):
     require(series in FRED, "unknown series")
     require(bool(rows), "no observations")
     require(all(type(d) is dt.date and d <= as_of and type(v) in (int, float)
@@ -65,6 +66,11 @@ def market_history(rows, series, as_of, source, input_kind):
     candidates = [d for d in dates if 0 <= (target - d).days <= 7]
     require(bool(candidates), "missing annual baseline")
     annual = candidates[-1]
+    calendar_receipt = None
+    if require_schedule:
+        annual = scheduled_sessions("US", target-dt.timedelta(days=7), target)[-1]
+        calendar_receipt = check_coverage("US", rows, annual, as_of)
+    status = "MATCHED_PUBLISHED_SCHEDULE" if calendar_receipt else "PROVISIONAL_CALENDAR_UNVERIFIED"
     checked = [d for d in dates if d >= annual]
     require(all((b-a).days <= 7 for a,b in zip(checked,checked[1:])), "history gap")
     def baseline(days):
@@ -79,7 +85,7 @@ def market_history(rows, series, as_of, source, input_kind):
         value = 100 * (rows[end] / rows[day] - 1)
         require(math.isfinite(value), "non-finite return")
         return dict(field(value, "%", end), baseline_date=str(day), baseline=rows[day],
-                    verification_status="PROVISIONAL_CALENDAR_UNVERIFIED",
+                    verification_status=status,
                     elapsed_calendar_days=(end-day).days)
     series_dates = [d for d in dates if d >= window]
     require(series_dates and (series_dates[0]-window).days <= 7, "incomplete 52-week window")
@@ -89,22 +95,23 @@ def market_history(rows, series, as_of, source, input_kind):
                         for i in range((end-annual).days+1)
                         if (annual+dt.timedelta(days=i)).weekday()<5
                         and annual+dt.timedelta(days=i) not in rows]
-    daily = dict(change(dates[-2]), basis="previous available observation; not verified previous trading session")
+    daily = dict(change(dates[-2]), basis=("previous scheduled session" if calendar_receipt else "previous available observation; not verified previous trading session"))
     return {
-        "verification_status": "PROVISIONAL_CALENDAR_UNVERIFIED",
+        "verification_status": status,
+        "schedule_receipt": calendar_receipt,
         "unexplained_weekdays_including_possible_holidays": missing_weekdays,
         "instrument": series, "variant": "price index, daily close",
-        "input_kind": input_kind, "calendar_validation": "bounded gaps; exchange holiday calendar not verified",
+        "input_kind": input_kind, "calendar_validation": ("published schedule matched; cutoff/source not independently authenticated" if calendar_receipt else "bounded gaps; exchange holiday calendar not verified"),
         "level": field(rows[end], "index points", end),
         "1D": daily, "1W": dict(change(baseline(7)), basis="7 calendar days, prior available observation"),
         "1Y": dict(change(annual), basis="365 calendar days, prior available observation"),
-        "52W_low_close": dict(field(rows[lo], "index points", lo), verification_status="PROVISIONAL_CALENDAR_UNVERIFIED"),
-        "52W_high_close": dict(field(rows[hi], "index points", hi), verification_status="PROVISIONAL_CALENDAR_UNVERIFIED"),
+        "52W_low_close": dict(field(rows[lo], "index points", lo), verification_status=status),
+        "52W_high_close": dict(field(rows[hi], "index points", hi), verification_status=status),
         "series": [field(rows[d], "index points", d) for d in series_dates],
     }
 
 
-def private_fetch(series, as_of):
+def private_fetch(series, as_of, require_schedule=False):
     # Prevent accidental data redistribution in CI. Use only for personal use.
     require(not os.getenv("CI") and not os.getenv("GITHUB_ACTIONS"), "live market retrieval disabled in CI")
     url = fred_url(series, as_of)
@@ -115,7 +122,7 @@ def private_fetch(series, as_of):
         raw = response.read(2_000_001)
     require(len(raw) <= 2_000_000, "response too large")
     return market_history(parse_fred(raw.decode("utf-8-sig"), series, as_of),
-                          series, as_of, url, "live FRED CSV")
+                          series, as_of, url, "live FRED CSV", require_schedule=require_schedule)
 
 
 class MarketTests(unittest.TestCase):
@@ -170,6 +177,18 @@ class MarketTests(unittest.TestCase):
         self.assertEqual(result["1D"]["baseline_date"], "2026-01-01")
         with self.assertRaises(ValueError):
             self.calc(self.rows | {dt.date(2026,1,3):100})
+    def test_strict_published_schedule(self):
+        end=dt.date(2026,11,24)
+        rows={d:100.0 for d in scheduled_sessions("US",dt.date(2025,11,10),end)}
+        def calculate(data):
+            return market_history(data,"SP500",end,"synthetic","synthetic",require_schedule=True)
+        result=calculate(rows)
+        self.assertEqual(result["verification_status"],"MATCHED_PUBLISHED_SCHEDULE")
+        self.assertEqual(result["1D"]["baseline_date"],"2026-11-23")
+        self.assertEqual(result["1Y"]["baseline_date"],"2025-11-24")
+        for missing in (end,dt.date(2026,11,23),dt.date(2026,7,6)):
+            with self.assertRaises(ValueError):
+                calculate({d:v for d,v in rows.items() if d!=missing})
     def test_no_substitution(self):
         with self.assertRaises(ValueError):
             fred_url("FTSE All-World",self.end)
@@ -184,17 +203,18 @@ def main():
     mode.add_argument("--csv",help="official FRED CSV downloaded for personal use")
     mode.add_argument("--fetch",action="store_true",help="personal-use live retrieval")
     p.add_argument("--personal-use",action="store_true",required=True)
+    p.add_argument("--require-schedule",action="store_true",help="require full published 2025-2026 schedule; as-of must be completed-session cutoff")
     a = p.parse_args()
     require(not os.getenv("CI") and not os.getenv("GITHUB_ACTIONS"), "real market output disabled in CI")
     if a.fetch:
-        result = private_fetch(a.series,a.as_of)
+        result = private_fetch(a.series,a.as_of,require_schedule=a.require_schedule)
     else:
         with open(a.csv,encoding="utf-8-sig") as f:
             data=f.read(2_000_001)
         require(len(data)<=2_000_000,"input too large")
         result=market_history(parse_fred(data,a.series,a.as_of),a.series,a.as_of,
                               "https://fred.stlouisfed.org/series/"+a.series,
-                              "user-supplied CSV; origin not independently authenticated")
+                              "user-supplied CSV; origin not independently authenticated",require_schedule=a.require_schedule)
     print(json.dumps(result,allow_nan=False,sort_keys=True))
 
 
