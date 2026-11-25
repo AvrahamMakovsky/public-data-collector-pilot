@@ -136,6 +136,8 @@ def live():
             except Exception as e: failures.append(name); print(name,'FAIL',repr(e),flush=True)
     require(not failures,str(failures))
 if __name__=='__main__':
-    suite=unittest.defaultTestLoader.loadTestsFromTestCase(Tests)
+    from market_history import MarketTests
+    suite=unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(Tests),
+                              unittest.defaultTestLoader.loadTestsFromTestCase(MarketTests)])
     require(unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful(),'regressions')
     live()
