@@ -59,7 +59,8 @@ def market_history(rows, series, as_of, source, input_kind):
     end = dates[-1]
     require(0 <= (as_of - end).days <= 4, "stale latest close")
     require(len(dates) >= 2, "missing previous close")
-    window = end - dt.timedelta(days=364)
+    require(all(d.weekday() < 5 for d in dates), "unexpected US weekend observation")
+    window = end - dt.timedelta(days=363)
     target = end - dt.timedelta(days=365)
     candidates = [d for d in dates if 0 <= (target - d).days <= 7]
     require(bool(candidates), "missing annual baseline")
@@ -75,19 +76,30 @@ def market_history(rows, series, as_of, source, input_kind):
         return {"value": value, "unit": unit, "date": str(day), "source": source}
     def change(day):
         require(day < end, "invalid baseline")
-        return dict(field(100 * (rows[end] / rows[day] - 1), "%", end),
-                    baseline_date=str(day), baseline=rows[day])
+        value = 100 * (rows[end] / rows[day] - 1)
+        require(math.isfinite(value), "non-finite return")
+        return dict(field(value, "%", end), baseline_date=str(day), baseline=rows[day],
+                    verification_status="PROVISIONAL_CALENDAR_UNVERIFIED",
+                    elapsed_calendar_days=(end-day).days)
     series_dates = [d for d in dates if d >= window]
     require(series_dates and (series_dates[0]-window).days <= 7, "incomplete 52-week window")
     lo = min(series_dates, key=rows.get)
     hi = max(series_dates, key=rows.get)
+    missing_weekdays = [str(annual+dt.timedelta(days=i))
+                        for i in range((end-annual).days+1)
+                        if (annual+dt.timedelta(days=i)).weekday()<5
+                        and annual+dt.timedelta(days=i) not in rows]
+    daily = dict(change(dates[-2]), basis="previous available observation; not verified previous trading session")
     return {
+        "verification_status": "PROVISIONAL_CALENDAR_UNVERIFIED",
+        "unexplained_weekdays_including_possible_holidays": missing_weekdays,
         "instrument": series, "variant": "price index, daily close",
         "input_kind": input_kind, "calendar_validation": "bounded gaps; exchange holiday calendar not verified",
         "level": field(rows[end], "index points", end),
-        "1D": change(dates[-2]), "1W": change(baseline(7)), "1Y": change(annual),
-        "52W_low_close": field(rows[lo], "index points", lo),
-        "52W_high_close": field(rows[hi], "index points", hi),
+        "1D": daily, "1W": dict(change(baseline(7)), basis="7 calendar days, prior available observation"),
+        "1Y": dict(change(annual), basis="365 calendar days, prior available observation"),
+        "52W_low_close": dict(field(rows[lo], "index points", lo), verification_status="PROVISIONAL_CALENDAR_UNVERIFIED"),
+        "52W_high_close": dict(field(rows[hi], "index points", hi), verification_status="PROVISIONAL_CALENDAR_UNVERIFIED"),
         "series": [field(rows[d], "index points", d) for d in series_dates],
     }
 
@@ -149,6 +161,15 @@ class MarketTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 private_fetch("SP500",self.end)
             fetch.assert_not_called()
+    def test_missing_session_not_verified(self):
+        rows = dict(self.rows)
+        del rows[dt.date(2026,1,2)]
+        result = self.calc(rows)
+        self.assertEqual(result["1D"]["verification_status"], "PROVISIONAL_CALENDAR_UNVERIFIED")
+        self.assertIn("2026-01-02", result["unexplained_weekdays_including_possible_holidays"])
+        self.assertEqual(result["1D"]["baseline_date"], "2026-01-01")
+        with self.assertRaises(ValueError):
+            self.calc(self.rows | {dt.date(2026,1,3):100})
     def test_no_substitution(self):
         with self.assertRaises(ValueError):
             fred_url("FTSE All-World",self.end)
